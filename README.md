@@ -56,6 +56,8 @@ bci2k-protocol/
 
 > **Important:** The BCI2000 installation itself couldn't be added, it can't be committed to the Git repository.
 
+You can install it from here -> [Google Drive](https://drive.google.com/file/d/1ij4WpRcHWx9pmWFX2hJt-ylom7hAeJmF/view?usp=sharing).
+
 ## 3. Install the g.HIamp Drivers
 
 The **g.HIamp drivers must be installed on the computer** before the experiment can communicate with the EEG amplifier.
@@ -63,6 +65,8 @@ The **g.HIamp drivers must be installed on the computer** before the experiment 
 Install the appropriate g.tec/g.HIamp drivers for the system and verify that the computer recognizes the amplifier before attempting to run the experiment.
 
 BCI2000 will not be able to communicate with the g.HIamp hardware correctly if the required drivers are missing.
+
+You can install it from here -> [Dropbox](https://www.dropbox.com/scl/fi/39mqqgyoot54ryiy9oh03/drivers.zip?rlkey=tayxikf5rwsw20pu2corkkh4l&st=drwow7pr&dl=0).
 
 ## 4. Create a Python Virtual Environment
 
