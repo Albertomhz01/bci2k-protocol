@@ -54,7 +54,7 @@ bci2k-protocol/
 └── README.md
 ```
 
-> **Important:** The BCI2000 installation itself should generally not be committed to the Git repository.
+> **Important:** The BCI2000 installation itself couldn't be added, it can't be committed to the Git repository.
 
 ## 3. Install the g.HIamp Drivers
 
