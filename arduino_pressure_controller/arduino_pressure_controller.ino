@@ -1,31 +1,25 @@
 // =====================================================================
-// PRESSURE CONTROLLER  --  MPX5050DP + L298N + solenoide de 3 vias
+// PRESSURE CONTROLLER  --  MPX5050DP + L298N + 3-way solenoid
 //
-// Protocolo serial (115200 baud), este es el contrato con Python:
+// Serial protocol (115200 baud), contract with Python:
 //
-//   RECIBE:
-//     START,<mmHg>   inicia el inflado hasta esa presion
-//     STOP           corte de emergencia (apaga bomba y ventea)
-//     ZERO           recalibra el cero del sensor (manguito SIN presion)
-//     PING           responde READY (para verificar el enlace)
+//   RECEIVES:
+//     START,<mmHg>   inflate to that pressure
+//     STOP           emergency stop (pump off, vent)
+//     ZERO           recalibrate sensor zero (cuff with NO pressure)
+//     PING           replies READY (link check)
 //
-//   ENVIA:
-//     READY                     al arrancar y al recibir PING
-//     ZERO,OK,<offset>          cero medido y aplicado, en mmHg
-//     ZERO,SKIPPED,<lectura>    habia presion al arrancar, no se auto cero
-//     INFLATING                 al aceptar el START
-//     HOLDING                   al alcanzar la presion objetivo
-//     DEFLATING                 al terminar el HOLD
-//     DONE                      cuando el sensor baja de DEFLATE_DONE_MMHG
-//                               (3 mmHg). Ese es el UNICO criterio de fin.
-//     STOPPED                   confirmacion de un STOP
-//     FAULT,<motivo>            algo salio mal, ya se venteo por seguridad
-//     P,<actual>,<objetivo>     TELEMETRIA, ~20 Hz, SIEMPRE, en mmHg
-//
-// La linea "P,..." es la que alimenta la barra de progreso en Python.
-// El 100% de la barra es <objetivo>, asi que si el trial pide 70 mmHg,
-// 70 llena la barra, y si pide 30 mmHg, 30 la llena. No hay ningun
-// temporizador involucrado: la barra ES la presion del sensor.
+//   SENDS:
+//     READY                     on boot and on PING
+//     ZERO,OK,<offset>          zero measured and applied, in mmHg
+//     ZERO,SKIPPED,<reading>    pressure present at boot, zero skipped
+//     INFLATING                 START accepted
+//     HOLDING                   target pressure reached
+//     DEFLATING                 HOLD finished
+//     DONE                      sensor below DEFLATE_DONE_MMHG (3 mmHg)
+//     STOPPED                   STOP confirmed
+//     FAULT,<reason>            error, already vented for safety
+//     P,<actual>,<target>       telemetry, ~20 Hz, always, in mmHg
 // =====================================================================
 
 const int enA       = 9;
@@ -34,67 +28,53 @@ const int In2       = 7;
 const int solenoide = 2;
 const int MPX       = A4;
 
-// --- Calibracion del sensor -----------------------------------------
-const float V_OFFSET    = 0.190;   // volts a 0 kPa
-const float SENSITIVITY = 0.085;   // volts por kPa
+// --- Sensor calibration ---
+const float V_OFFSET    = 0.190;   // volts at 0 kPa
+const float SENSITIVITY = 0.085;   // volts per kPa
 const float KPA_TO_MMHG = 7.50062;
 
-// --- Filtro -----------------------------------------------------------
+// --- Filter ---
 const float ALPHA   = 0.15;
-const int   SAMPLES = 32;          // antes 128: bajarlo agiliza el lazo
+const int   SAMPLES = 32;          // fewer samples = faster loop
 
-// --- Actuadores -------------------------------------------------------
-const int SOLENOID_CLOSED = HIGH;  // retiene la presion en el manguito
-const int SOLENOID_VENT   = LOW;   // abre la via de escape
+// --- Actuators ---
+const int SOLENOID_CLOSED = HIGH;  // holds pressure in the cuff
+const int SOLENOID_VENT   = LOW;   // opens the vent path
 const int PUMP_PWM        = 170;
 const int PUMP_OFF        = 0;
 
-// --- Tiempos ----------------------------------------------------------
-const unsigned long HOLD_DURATION  = 10000UL;  // debe coincidir con HOLD_SECONDS de Python
+// --- Timing ---
+const unsigned long HOLD_DURATION  = 10000UL;  // must match HOLD_SECONDS in Python
 const unsigned long TELEMETRY_MS   = 50UL;     // 20 Hz
 
-// Unico watchdog que queda: tiempo maximo con la BOMBA ENCENDIDA.
-// No es un castigo por inflar lento. Es el ultimo seguro fisico: si se sale
-// una manguera o el sensor se muere leyendo bajo, esto es lo unico que impide
-// que la bomba siga metiendo aire al brazo del participante para siempre.
-// A ~5 mmHg/s, 70 mmHg se alcanzan en ~15 s. 60 s es enorme y no deberia
-// dispararse nunca en un trial sano.
+// Only watchdog: max time with the pump ON. Last physical safety in case a
+// hose disconnects or the sensor fails reading low. Should never trigger in
+// a normal trial (~15 s to reach 70 mmHg).
 const unsigned long MAX_INFLATE_MS = 60000UL;
 
-// --- Seguridad --------------------------------------------------------
-const float MAX_SAFE_MMHG     = 200.0;  // por encima de esto se ventea sin preguntar
+// --- Safety ---
+const float MAX_SAFE_MMHG     = 200.0;  // above this, vent immediately
 
-// UNICO criterio de fin de desinflado. El manguito esta vacio cuando el
-// MPX5050DP marca menos de esto. No hay detector de meseta, ni cronometro,
-// ni nada mas: se ventea hasta llegar aqui, tarde lo que tarde.
+// Only end-of-deflation criterion: cuff is empty when the sensor reads below
+// this. No timer; vents until reached.
 const float DEFLATE_DONE_MMHG = 3.0;    // mmHg
 
-// --- Auto cero --------------------------------------------------------
-// El offset real del MPX5050DP no es exactamente V_OFFSET. Al arrancar,
-// con el manguito abierto al ambiente, medimos lo que el sensor cree que
-// es "cero" y lo restamos de aqui en adelante. Sin esto, un offset de unos
-// pocos cuentas de ADC hace que la presion nunca baje del umbral de DONE.
-const float ZERO_MAX_ACCEPT_MMHG = 20.0;  // si al arrancar lee mas que esto, no auto ceramos
+// --- Auto zero ---
+// The real sensor offset differs from V_OFFSET. On boot (cuff vented) the
+// "zero" reading is measured and subtracted; otherwise pressure may never
+// drop below the DONE threshold.
+const float ZERO_MAX_ACCEPT_MMHG = 20.0;  // skip auto zero if boot reading exceeds this
 
-// --- Rechazo de picos electricos --------------------------------------
-// El solenoide y el L298N conmutan corriente justo al lado de una linea
-// analogica. Un transitorio puede rielar el ADC por una lectura y hacer que
-// el sensor "vea" cientos de mmHg que nunca existieron.
-//
-// La presion en un manguito es un sistema LENTO: sube a unos 5 mmHg/s y baja
-// a unos 5 mmHg/s. Un salto de mas de MAX_SLEW_MMHG entre dos lecturas
-// consecutivas (separadas ~10 ms) equivale a miles de mmHg/s. Eso no es aire,
-// es ruido, y se descarta.
-//
-// Pero si el salto PERSISTE muchas lecturas seguidas, ya no es un transitorio:
-// el sensor se desconecto o cambio de verdad. Entonces si se acepta, y el
-// resto de las protecciones actuan sobre el valor nuevo.
+// --- Electrical spike rejection ---
+// Solenoid/L298N switching can spike the ADC. Cuff pressure changes slowly
+// (~5 mmHg/s), so a jump > MAX_SLEW_MMHG between consecutive readings is noise
+// and is discarded. If the jump persists for MAX_CONSECUTIVE_GLITCH readings,
+// it is accepted as a real change.
 const float MAX_SLEW_MMHG          = 40.0;
 const int   MAX_CONSECUTIVE_GLITCH = 25;
 
-// La sobrepresion tampoco se declara con UNA lectura. Se exigen varias
-// seguidas, porque una sobrepresion real dura (la bomba sigue metiendo aire),
-// mientras que un pico electrico dura una sola vuelta del lazo.
+// Overpressure requires several consecutive readings (real overpressure
+// persists; an electrical spike lasts one loop).
 const int OVERPRESSURE_HITS = 20;
 
 int glitchCount       = 0;
@@ -135,7 +115,7 @@ void vent()
 void setup()
 {
   Serial.begin(115200);
-  Serial.setTimeout(20);   // readStringUntil no debe bloquear el lazo
+  Serial.setTimeout(20);   // readStringUntil must not block the loop
 
   pinMode(enA,       OUTPUT);
   pinMode(In1,       OUTPUT);
@@ -150,13 +130,13 @@ void setup()
   currentState = IDLE;
   targetMmhg   = 0.0;
 
-  zeroSensor();   // el manguito debe estar SIN presion al conectar el USB
+  zeroSensor();   // cuff must have NO pressure when USB is connected
 
   Serial.println("READY");
 }
 
-// Lectura CRUDA, sin corregir el cero y sin filtrar. Puede salir negativa,
-// y asi tiene que ser: es lo que nos permite medir el offset real.
+// Raw reading: no zero correction, no filtering. Can be negative (needed to
+// measure the real offset).
 float readRawMmhg()
 {
   long sum = 0;
@@ -169,7 +149,7 @@ float readRawMmhg()
 
   float kpa = (voltage - V_OFFSET) / SENSITIVITY;
 
-  return kpa * KPA_TO_MMHG;   // TODO el sketch trabaja en mmHg
+  return kpa * KPA_TO_MMHG;   // the whole sketch works in mmHg
 }
 
 float readPressure()
@@ -197,13 +177,11 @@ float readPressure()
   {
     glitchCount++;
 
-    // Pico aislado: se tira la lectura y se conserva la anterior. El aire no
-    // puede moverse asi de rapido, asi que no perdemos informacion real.
+    // Isolated spike: discard reading, keep previous value.
     if (glitchCount < MAX_CONSECUTIVE_GLITCH)
       return filteredMmhg;
 
-    // Ya no es un pico: el sensor lleva mucho rato diciendo otra cosa.
-    // Se acepta el valor nuevo y se resiembra el filtro.
+    // Persistent change: accept new value and reseed the filter.
     glitchCount  = 0;
     filteredMmhg = mmhg;
 
@@ -217,13 +195,12 @@ float readPressure()
   return filteredMmhg;
 }
 
-// Mide el cero del sensor con el manguito ABIERTO al ambiente. Se llama al
-// arrancar y cada vez que Python manda ZERO. Si en ese momento hay presion
-// de verdad en el manguito, NO auto cera (se estaria comiendo presion real).
+// Measures sensor zero with the cuff vented. Called on boot and on ZERO.
+// Skipped if real pressure is present.
 void zeroSensor()
 {
   vent();
-  delay(300);   // dejar que se estabilice antes de medir
+  delay(300);   // let it settle before measuring
 
   float sum = 0.0;
 
@@ -240,17 +217,17 @@ void zeroSensor()
     zeroOffsetMmhg = 0.0;
 
     Serial.print("ZERO,SKIPPED,");
-    Serial.println(avg, 1);   // hay presion real, o el sensor esta mal cableado
+    Serial.println(avg, 1);   // real pressure present, or sensor miswired
   }
   else
   {
     zeroOffsetMmhg = avg;
 
     Serial.print("ZERO,OK,");
-    Serial.println(avg, 1);   // este es el offset que estaba rompiendo el DONE
+    Serial.println(avg, 1);   // measured offset
   }
 
-  emaSeeded    = false;   // el filtro se resiembra con la escala ya corregida
+  emaSeeded    = false;   // reseed filter with corrected scale
   filteredMmhg = 0.0;
 }
 
@@ -306,7 +283,7 @@ void checkSerial()
       return;
     }
 
-    targetMmhg = requested;   // ya viene en mmHg, no se convierte nada
+    targetMmhg = requested;   // already in mmHg
 
     digitalWrite(solenoide, SOLENOID_CLOSED);
     analogWrite(enA, PUMP_PWM);
@@ -355,14 +332,9 @@ void loop()
 
   sendTelemetry(pressure);
 
-  // --- Seguridad, por encima de cualquier estado -----------------------
-  //
-  // La sobrepresion SOLO se vigila cuando la bomba puede meter aire, o sea
-  // en PUMPING y HOLDING. Durante DEFLATING la bomba esta apagada y la valvula
-  // esta abierta al ambiente: ahi una lectura de 200 mmHg no puede ser fisica,
-  // es ruido electrico por definicion. Vigilarla ahi solo abortaba trials
-  // buenos (y eso es exactamente lo que paso en el Trial 1, a 45 mmHg y
-  // BAJANDO).
+  // --- Safety, above any state -----------------------------------------
+  // Overpressure is only checked in PUMPING and HOLDING. During DEFLATING the
+  // pump is off and the valve is open, so a high reading is electrical noise.
   if (currentState == PUMPING || currentState == HOLDING)
   {
     if (pressure > MAX_SAFE_MMHG)
@@ -391,7 +363,7 @@ void loop()
 
       if (pressure >= targetMmhg)
       {
-        pumpOff();   // el solenoide sigue cerrado: el manguito retiene
+        pumpOff();   // solenoid stays closed: cuff holds pressure
 
         currentState = HOLDING;
         phaseStart   = millis();
@@ -421,9 +393,7 @@ void loop()
 
     case DEFLATING:
 
-      // UNICO criterio de fin: el sensor marca menos de DEFLATE_DONE_MMHG.
-      // La valvula queda abierta al ambiente y la bomba apagada. Si tarda,
-      // tarda: no hay cronometro, no hay detector de meseta, no hay falla.
+      // Only end criterion: sensor below DEFLATE_DONE_MMHG. No timeout.
       if (pressure < DEFLATE_DONE_MMHG)
       {
         vent();
