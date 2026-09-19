@@ -6,23 +6,15 @@ import re
 from datetime import datetime
 
 
-# Carpeta donde BCI2000 guarda los .dat. Tiene que ser LA MISMA que
-# DATA_DIRECTORY de bci_setup_cruz_con_ruta.py, porque de ahí sale el
-# número de run.
+# Folder where BCI2000 saves .dat files -> must match DATA_DIRECTORY.
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIRECTORY = os.path.join(HERE, "dat_bci")
 
 
 def next_run_from_disk(participant_number, session_number):
-    """Siguiente número de run según los .dat que YA existen en disco.
-
-    El experiment_log.csv se escribe en cuanto le das clic a START, o sea
-    antes de que BCI2000 grabe un solo byte. Si una corrida truena al
-    arrancar (Arduino, módulos, lo que sea), el CSV ya contó ese run pero
-    el .dat nunca existió, y la numeración se brinca un número.
-
-    Los archivos en disco son la única fuente de verdad: si están R01 y
-    R02, el siguiente es R03. Punto.
+    """Get the next run number from existing .dat files.
+    The files on disk are the source of truth: if R01 and R02 exist, 
+    the next is R03.
     """
     subject = "P" + str(participant_number).zfill(3)
     session = str(session_number).zfill(3)
@@ -53,9 +45,9 @@ def load_experiment_log():
 
 
 def find_participant(name, session_number=None):
-    """Busca al participante por nombre. Si se pasa session_number, filtra
-    también por sesión — sin eso, al pasar a la sesión 2 el run seguiría
-    en R05 en vez de reiniciar en R01."""
+    """Finds the participant by name...
+    filters by session if provided to reset runs from R01.
+    """
     records = load_experiment_log()
 
     matches = []
@@ -253,8 +245,7 @@ def launch_interface():
             status_label.config(fg=NEW_FG)
 
     def on_session_change(*args):
-        """Si cambias la sesión a mano, el run se recalcula para ESA sesión.
-        Sin esto, empezar la sesión 2 seguiría contando R05, R06..."""
+        """Recalculates the run for the selected session, restarting from R01."""
         name = name_entry.get().strip()
         session = session_entry.get().strip()
 

@@ -10,19 +10,7 @@ from bci_setup_cruz_con_ruta import setup_bci
 import serial                       # pip install pyserial
 import serial.tools.list_ports
 
-# NOTA: ya no usamos la librería "keyboard" (requería permisos de
-# administrador en Windows para detectar teclas de forma confiable).
-# En su lugar, el programa espera a que escribas algo en la misma
-# terminal y presiones Enter — no necesita ninguna librería extra ni
-# permisos especiales.
-
-# Presión de la condición control. YA NO es 0: el manguito se infla también
-# en NONE, solo que muy poco (8 mmHg). Así el participante siente el mismo
-# ruido de bomba, la misma vibración y el mismo contacto en las tres
-# condiciones, y lo único que cambia entre NONE/LOW/HIGH es la CANTIDAD de
-# presión — que es justo lo que queremos que distinga el clasificador.
-#
-# Se puede sobrescribir desde participant_XXX.json con "none_pressure".
+# Control pressure is 8 mmHg so all conditions share the same pump noise and vibration.
 NONE_PRESSURE    = 8
 LOW_LABEL        = "LOW"
 HIGH_LABEL       = "HIGH"
@@ -31,102 +19,57 @@ NONE_LABEL       = "NONE"
 TRIALS_PER_BLOCK = 30
 TRIALS_PER_COND  = 10
 
-# DISEÑO DE UN SOLO RUN.
-#
-# Antes el experimento eran 4 bloques = 4 ejecuciones (R01..R04), con la
-# calibración solo en la primera y los trials numerados de corrido (el
-# bloque 2 empezaba en el trial 31).
-#
-# Ahora cada ejecución es un experimento COMPLETO y autocontenido:
-#   - calibración SIEMPRE
-#   - trials numerados 1..TRIALS_PER_BLOCK, siempre
-#   - un .dat que se cierra al terminar
-#
-# Volver a correr el programa con el mismo participante y sesión genera R02,
-# luego R03, etc. (participant_interface.next_run_from_disk cuenta los .dat
-# que ya existen). No hay un número total de runs previsto: se corre las
-# veces que haga falta.
+# SINGLE-RUN DESIGN: each run is a self-contained experiment
+# (calibration, trials 1..TRIALS_PER_BLOCK, one .dat file).
+# Re-running the same participant/session creates R02, R03, etc.
 TRIALS_TOTAL     = TRIALS_PER_BLOCK
 
 BLOCK_REST       = 30
 
-CROSS_TIME       = 3    # Evento 0 — cruz de fijación
-ITI_TIME         = 10   # Evento 4 — DESCANSO (dentro del propio trial)
-
-# Estos tres YA NO controlan nada: ahora las tres condiciones usan la bomba
-# real y quien marca el ritmo es el Arduino (llega a la presión -> HOLDING;
-# pasan HOLD_DURATION ms -> DEFLATING; baja de 3 mmHg -> DONE). Se dejan
-# como referencia de las duraciones esperadas, para el análisis.
-INFLATING_TIME   = 7    # Evento 1 — INFLATING (referencia)
-HOLDING_TIME     = 10   # Evento 2 — HOLDING   (referencia)
-DEFLATING_TIME   = 3    # Evento 3 — DEFLATING (referencia)
+CROSS_TIME       = 3    # Event 0 — Fixation Cross
+ITI_TIME         = 10   # Event 4 — Rest (part of the same trial)
 
 PAIN_MAP = {NONE_LABEL: 0, LOW_LABEL: 1, HIGH_LABEL: 2}
 
+# --- Arduino (pressure pump) ---
+# Serial port. None = auto-detect.
+ARDUINO_PORT = None          # e.g. "COM3"
+ARDUINO_BAUD = 115200        # Must match Serial.begin() in the .ino
 
-# --- Arduino (bomba de presión real) ---------------------------------------
-# Puerto serial del Arduino. En Windows suele ser "COM3", "COM4", etc.
-# Déjalo en None para intentar autodetectarlo (busca un puerto Arduino/CH340).
-ARDUINO_PORT = None          # p. ej. "COM3"  — pon el tuyo aquí si autodetección falla
-ARDUINO_BAUD = 115200        # debe coincidir con Serial.begin() del .ino
-
-# --- Sin watchdogs de software ----------------------------------------------
-# ANTES había un detector de estancamiento (STALL_*) y cronómetros por fase
-# (ACK/INFLATE/HOLD/DEFLATE_TIMEOUT). Abortaban trials que solo eran lentos.
-#
-# AHORA: Python NO aborta nada por tiempo. Espera a que el Arduino reporte la
-# siguiente fase, tarde lo que tarde. El fin del desinflado lo decide UNA sola
-# cosa, y vive en el .ino: el MPX5050DP tiene que marcar menos de
-# DEFLATE_DONE_MMHG (3 mmHg). Ese es el único criterio.
-#
-# Lo único que sigue deteniendo un trial es un FAULT del Arduino, y el Arduino
-# solo levanta FAULT si se disparó un seguro físico real (sobrepresión o bomba
-# encendida más de MAX_INFLATE_MS). Eso no es un castigo por lentitud: es lo
-# que evita que la bomba siga inflando el brazo del participante si se sale una
-# manguera o el sensor deja de leer.
-
-# Cada cuánto imprimir la presión en consola mientras infla (para que puedas
-# VER qué tan rápido sube y diagnosticar la bomba con números reales).
+# Deflation ends when the MPX5050DP reads below DEFLATE_DONE_MMHG (3 mmHg).
+# A trial only stops on an Arduino FAULT (overpressure or pump exceeding MAX_INFLATE_MS).
 PRESSURE_LOG_INTERVAL = 1.0
 
-# HOLD_SECONDS tiene que ser IGUAL a HOLD_DURATION del .ino (10000 ms).
-# Es el único número que vive duplicado en los dos programas, así que si
-# cambias uno tienes que cambiar el otro.
+# Must match HOLD_DURATION in the .ino (10000 ms).
 HOLD_SECONDS = 10.0
 
-# Presión máxima que este programa acepta pedirle al Arduino. El .ino tiene
-# su propio tope (MAX_SAFE_MMHG); este es el filtro del lado de Python, para
-# que un JSON de participante mal escrito no llegue nunca al hardware.
+# Maximum pressure Python can request; guards against bad participant JSON values.
 MAX_SAFE_MMHG = 200.0
 
-# Palabras que el Arduino manda cuando algo salió mal. Si aparecen mientras
-# esperamos una fase, el trial se aborta de inmediato en vez de quedarse
-# esperando una fase que ya nunca va a llegar.
+# Arduino error messages; abort the trial if received.
 FAULT_WORDS = ("STOPPED", "FAULT")
 
-# Vocabulario completo del protocolo. Todo lo que NO esté aquí (ni sea
-# telemetría "P,...") es basura: una línea partida por un desborde de buffer.
+# Protocol phase vocabulary.
 PHASE_WORDS = ("READY", "INFLATING", "HOLDING", "DEFLATING", "DONE")
 
 
 class PumpError(Exception):
-    """Error de comunicación con el Arduino de la bomba."""
+    """Communication error with the pump Arduino."""
     pass
 
 
 class PumpTimeoutError(PumpError):
-    """El Arduino no reportó la siguiente fase a tiempo -> se manda STOP."""
+    """Arduino did not report the next phase in time; STOP is sent."""
     pass
 
 
 class PumpFaultError(PumpError):
-    """El Arduino reportó una falla (FAULT/STOPPED) y ya venteó por su cuenta."""
+    """Arduino reported FAULT/STOPPED and already vented."""
     pass
 
 
 def _autodetect_arduino_port():
-    """Busca un puerto que parezca un Arduino/clon CH340. Devuelve el device
-    (p. ej. 'COM3') o None si no encuentra nada convincente."""
+    """Returns the first port that looks like an Arduino/CH340, or None."""
     candidates = []
     for p in serial.tools.list_ports.comports():
         blob = f"{p.description} {p.manufacturer} {p.hwid}".lower()
@@ -138,14 +81,11 @@ def _autodetect_arduino_port():
 
 
 class ArduinoPump:
-    """Envoltura fina sobre el puerto serial del Arduino.
+    """Serial interface for the Arduino.
 
-    Protocolo (definido en arduino_pressure_controller.ino):
-        ->  START,<mmHg>   inicia inflado; responde  INFLATING
-                           al llegar a la presión    HOLDING
-                           tras HOLD_DURATION        DEFLATING
-                           al bajar de 3 mmHg        DONE
-        ->  STOP           corte de emergencia;      STOPPED
+    Protocol:
+        -> START,<mmHg>  -> INFLATING -> HOLDING -> DEFLATING -> DONE
+        -> STOP          -> STOPPED
     """
 
     def __init__(self, port=None, baud=ARDUINO_BAUD):
@@ -159,17 +99,15 @@ class ArduinoPump:
 
         self.port = port
         print(f"Abriendo Arduino en {port} @ {baud} baud...")
-        # timeout=0 -> lecturas NO bloqueantes (para no congelar la ventana tkinter)
+        # timeout=0 -> non-blocking reads so the Tkinter window doesn't freeze
         self.ser = serial.Serial(port, baud, timeout=0)
 
-        # Al abrir el puerto el Arduino se reinicia (DTR). Hay que esperar a
-        # que arranque antes de mandarle nada, o el primer START se pierde.
+        # Opening the port resets the Arduino (DTR); wait for it to boot.
         time.sleep(2.0)
         self.ser.reset_input_buffer()
         self._buf = ""
 
-        # Última presión REAL leída del MPX5050DP (mmHg). La barra de la UI
-        # se dibuja a partir de esto, no de un temporizador.
+        # Latest MPX5050DP reading (mmHg), used by the UI.
         self.pressure_mmhg = 0.0
         self.target_mmhg   = 0.0
 
@@ -178,10 +116,7 @@ class ArduinoPump:
         print(f"Arduino listo en {port}. Presión actual: {self.pressure_mmhg:.1f} mmHg")
 
     def _handshake(self):
-        """Manda PING y espera READY. Confirma que del otro lado hay un
-        Arduino con ESTE firmware y no cualquier otro puerto serial. De paso
-        deja llegar la primera telemetría, para que la barra no arranque
-        creyendo que la presión es 0 cuando el manguito ya trae algo."""
+        """Sends PING and waits for READY to verify the firmware."""
         deadline = time.time() + 5.0
         self.ser.write(b"PING\n")
         self.ser.flush()
@@ -190,8 +125,7 @@ class ArduinoPump:
             line = self.read_line()
 
             if line and line.startswith("ZERO,"):
-                # El Arduino acaba de medir el cero real del MPX5050DP. Si el
-                # offset es grande, aqui es donde te enteras.
+                # Arduino just measured the sensor zero offset.
                 print(f"  [arduino] cero del sensor: {line}")
 
             if line == "READY":
@@ -206,24 +140,13 @@ class ArduinoPump:
         )
 
     def drain(self):
-        """Vacía el puerto serial SIN esperar ninguna fase.
-
-        ESTA ES LA FUNCIÓN QUE FALTABA. El Arduino manda telemetría a 20 Hz
-        SIEMPRE, esté inflando o en IDLE. Python solo leía el puerto dentro de
-        wait_for_phase(), o sea: durante la cruz, los trials NONE y los
-        descansos NADIE leía. Tres trials NONE seguidos = ~100 s sin leer, con
-        ~280 bytes/s entrando. El buffer del driver de Windows (4 KB) se
-        desborda y empieza a TIRAR bytes a media línea. Ahí se perdió el
-        "INFLATING" del trial 5, y Python se quedó esperándolo para siempre.
-
-        Llamando a esto en cada tick de la ventana, el buffer nunca se llena.
-        De paso, pressure_mmhg se mantiene fresco entre trials.
-        """
+        """Drains the serial buffer so 20 Hz telemetry doesn't overflow it
+        between trials, and keeps pressure_mmhg updated."""
         try:
             while self.ser.in_waiting:
-                self.read_line()   # actualiza pressure_mmhg; tira fases viejas
+                self.read_line()   # Updates pressure_mmhg, discards old phase messages
         except Exception:
-            pass   # un drain que falla no debe tumbar el experimento
+            pass   # A failed drain should not interrupt the experiment
 
     def send_start(self, mmhg):
         if mmhg <= 0 or mmhg > MAX_SAFE_MMHG:
@@ -234,18 +157,14 @@ class ArduinoPump:
 
         target = int(round(mmhg))
 
-        # Tirar TODO lo viejo antes de mandar el comando. Así el "INFLATING"
-        # que leamos a continuación es forzosamente el de ESTE trial, y no
-        # venimos arrastrando telemetría rancia de hace 100 segundos.
+        # Clear old data so the next phase message belongs to this trial.
         try:
             self.ser.reset_input_buffer()
         except Exception:
             pass
         self._buf = ""
 
-        # Fijamos el target localmente ANTES de mandar el comando. Así la
-        # barra ya sabe cuál es su 100% desde el primer frame, sin tener que
-        # esperar a que llegue la primera línea de telemetría.
+        # Set target locally first so the UI knows it immediately.
         self.target_mmhg = float(target)
 
         self.ser.write(f"START,{target}\n".encode("ascii"))
@@ -256,15 +175,12 @@ class ArduinoPump:
             self.ser.write(b"STOP\n")
             self.ser.flush()
         except Exception:
-            pass  # en un corte de emergencia no queremos que un error tape el STOP
+            pass  # Never let an error block an emergency STOP
 
     def read_line(self):
-        """Devuelve UNA línea de FASE del Arduino (INFLATING/HOLDING/...), o
-        None si todavía no hay ninguna. No bloquea.
-
-        Las líneas de telemetría ("P,<actual>,<target>") se consumen aquí
-        mismo: actualizan self.pressure_mmhg y NO se devuelven, para que el
-        código de fases no tenga que filtrarlas."""
+        """Non-blocking. Returns one phase line (INFLATING/HOLDING/...) or None.
+        Telemetry lines ("P,<actual>,<target>") update pressure_mmhg and are
+        not returned."""
         try:
             chunk = self.ser.read(256)
         except Exception:
@@ -280,7 +196,7 @@ class ArduinoPump:
             if not line:
                 continue
 
-            # ---- Telemetría de presión real ----
+            # --- Pressure telemetry ---
             if line.startswith("P,"):
                 parts = line.split(",")
                 if len(parts) >= 3:
@@ -289,13 +205,11 @@ class ArduinoPump:
                         self.target_mmhg   = float(parts[2])
                     except ValueError:
                         pass
-                continue   # no es una fase: seguir buscando
+                continue   # not a phase, keep looking
 
-            # ---- Palabra de fase real ----
-            # Solo se aceptan palabras del protocolo. Cualquier otra cosa es
-            # una línea truncada por un desborde del buffer (p. ej. "0,0.0",
-            # que es la cola de un "P,45,70.0" partido a la mitad) y se tira.
-            # ANTES esto se devolvía como si fuera una fase y ensuciaba el log.
+            # ---- Phase word ----
+            # Only protocol words are accepted; anything else is a truncated
+            # line from a buffer overflow and is discarded.
             if line in PHASE_WORDS or line.startswith(FAULT_WORDS) or line.startswith("ZERO,"):
                 return line
 
@@ -304,8 +218,7 @@ class ArduinoPump:
         return None
 
     def close(self):
-        """Cierra el puerto de forma segura, mandando STOP antes por si la
-        bomba seguía encendida."""
+        """Sends STOP, then closes the port."""
         try:
             self.send_stop()
             time.sleep(0.1)
@@ -318,16 +231,10 @@ class ArduinoPump:
 
 
 def wait_for_inflating_ack(pump, cross, pressure, resend_every=2.0):
-    """Espera el "INFLATING" que confirma que el Arduino recibió el START.
+    """Waits for "INFLATING" confirming the START was received.
+    Resends START every `resend_every` seconds until acked (resending is harmless).
 
-    Si no llega en `resend_every` segundos, REENVÍA el START. No aborta: sigue
-    reintentando. Un START perdido (cable, ruido, buffer) ya no congela el
-    experimento — simplemente se vuelve a mandar hasta que el Arduino conteste.
-
-    Mandar START dos veces es inofensivo: el .ino solo vuelve a fijar el target
-    y reinicia phaseStart.
-
-    Devuelve True cuando llega el ack, None si el usuario cerró la ventana.
+    Returns True on ack, None if the window was closed.
     """
     last_send = time.time()
     attempts  = 1
@@ -359,25 +266,18 @@ def wait_for_inflating_ack(pump, cross, pressure, resend_every=2.0):
 
 
 def wait_for_phase(pump, cross, target_word, bar_target=None, label_prefix=None):
-    """Mantiene viva la ventana tkinter mientras espera a que el Arduino
-    reporte `target_word` (p. ej. "HOLDING").
+    """Keeps the Tkinter window alive while waiting for `target_word`.
+    No timeout: a slow trial is still valid.
 
-    NO hay cronómetro. Espera indefinidamente. Un trial lento sigue siendo un
-    trial válido, así que el software no lo aborta.
+    bar_target: if given (mmHg), bar fill = actual pressure / bar_target.
 
-    bar_target: si se pasa (mmHg), la barra se dibuja como
-                presion_real / bar_target. O sea: el 100% de la barra ES la
-                presión objetivo de ESTE trial. Si el target es 70 mmHg, 70
-                llena la barra; si es 30, 30 la llena.
-
-    Devuelve True si llegó la fase, None si el usuario cerró la ventana.
-    Lanza PumpFaultError solo si el Arduino reporta FAULT/STOPPED (o sea, si
-    se disparó un seguro físico y el manguito YA se venteó).
+    Returns True when the phase arrives, None if the window was closed.
+    Raises PumpFaultError if the Arduino reports FAULT/STOPPED.
     """
     start = time.time()
 
-    last_log      = 0.0                  # throttle del log de consola
-    prev_logged_p = pump.pressure_mmhg   # para calcular la tasa de subida
+    last_log      = 0.0                  # console log throttle
+    prev_logged_p = pump.pressure_mmhg   # for rise-rate calculation
 
     while True:
         if not cross._running:
@@ -385,16 +285,14 @@ def wait_for_phase(pump, cross, target_word, bar_target=None, label_prefix=None)
 
         elapsed = time.time() - start
 
-        line = pump.read_line()   # también actualiza pump.pressure_mmhg
+        line = pump.read_line()   # also updates pump.pressure_mmhg
         if line:
             print(f"    [arduino] {line}")
 
             if line == target_word:
                 return True
 
-            # El Arduino ya venteó por su cuenta (sobrepresión, timeout de
-            # hardware, STOP). No tiene caso seguir esperando una fase que
-            # nunca va a llegar: abortamos ya.
+            # Arduino already vented on its own -> abort.
             if line.startswith(FAULT_WORDS):
                 raise PumpFaultError(
                     f"El Arduino abortó el trial: '{line}' "
@@ -403,22 +301,12 @@ def wait_for_phase(pump, cross, target_word, bar_target=None, label_prefix=None)
 
         current = pump.pressure_mmhg
 
-        # ---- Barra vinculada a la presión FÍSICA ----
-        #
-        # La barra SÍ se mueve con la presión real, pero la etiqueta de la
-        # ventana NUNCA muestra números. El participante solo ve la palabra
-        # de la fase (INFLATING/HOLDING/DEFLATING), que ya se puso una vez
-        # en run_real_pressure_phases antes de entrar aquí.
-        #
-        # Enseñarle "42 / 70 mmHg" le decía en qué condición estaba y qué
-        # tanto le faltaba: eso contamina el reporte subjetivo de dolor y
-        # mete expectativa en el EEG. Los números se quedan del lado del
-        # investigador, en la consola.
+        # Bar follows physical pressure. No numbers are shown to the participant
+        # (would reveal the condition and bias pain reports/EEG); mmHg stay in the console.
         if bar_target and bar_target > 0:
             cross.set_bar_fraction(max(0.0, min(1.0, current / bar_target)))
 
-        # ---- Log en consola: presión real y qué tan rápido sube ----
-        # (esto lo ve el investigador, no el participante)
+        # Researcher-only console log: pressure and rise rate.
         if bar_target and time.time() - last_log >= PRESSURE_LOG_INTERVAL:
             rate = (current - prev_logged_p) / max(1e-6, time.time() - last_log)
             phase_tag = label_prefix if label_prefix else "?"
@@ -427,15 +315,15 @@ def wait_for_phase(pump, cross, target_word, bar_target=None, label_prefix=None)
             last_log      = time.time()
             prev_logged_p = current
 
-        # Aquí NO hay watchdog. Ni de estancamiento ni de reloj. Se espera.
+        # No watchdog here, just wait.
 
         cross.update()
         time.sleep(0.005)
 
 
-# --- Modulación de la señal "cerebral" ficticia según la presión -----------
-AMPLITUDE_BASE_UV = 50.0   # amplitud cuando no hay presión / entre fases
-AMPLITUDE_GAIN_UV = 2.5    # cuánto sube la amplitud por cada mmHg de presión
+# --- Simulated "brain" signal amplitude as a function of pressure ---
+AMPLITUDE_BASE_UV = 50.0   # amplitude with no pressure / between phases
+AMPLITUDE_GAIN_UV = 2.5    # amplitude increase per mmHg
 
 
 def pressure_to_amplitude(pressure):
@@ -443,12 +331,12 @@ def pressure_to_amplitude(pressure):
 
 
 class BCI2000DisconnectedError(Exception):
-    """Se usa para detener el experimento por completo si BCI2000 se desconecta."""
+    """Stops the whole experiment if BCI2000 disconnects."""
     pass
 
 
 def set_signal_amplitude(bci, amplitude_uv):
-    """Cambia SineAmplitude en vivo. No requiere SetConfig ni detener el run."""
+    """Updates SineAmplitude live (no SetConfig or run stop needed)."""
     try:
         ok = bci.Execute(f"SET PARAMETER SineAmplitude {amplitude_uv:.1f}")
         if not ok:
@@ -459,8 +347,7 @@ def set_signal_amplitude(bci, amplitude_uv):
 
 
 def safe_set_state(bci, name, value):
-    """SetStateVariable. Si BCI2000 se desconectó, detiene el experimento
-    en vez de seguir corriendo trials 'a ciegas' sin conexión real."""
+    """SetStateVariable; stops the experiment if BCI2000 disconnected."""
     try:
         bci.SetStateVariable(name, value)
         return True
@@ -469,14 +356,9 @@ def safe_set_state(bci, name, value):
 
 
 def safe_set_states(bci, **states):
-    """Fija VARIOS estados en UNA sola llamada a BCI2000 (un solo viaje de
-    red), en vez de una llamada separada por estado. Esto reduce mucho el
-    margen de que dos estados que deberían cambiar juntos (ej. StimulusPhase
-    y PressureTarget al iniciar INFLATING) caigan en bloques de muestra
-    distintos por simple diferencia de timing entre llamadas separadas.
-    No garantiza alineación perfecta al 100% (BCI2000 aplica los estados
-    por bloques de muestras, eso es estructural del sistema), pero sí
-    minimiza los casos de desalineación visual."""
+    """Sets several states in one BCI2000 call to minimize misalignment
+    between states that should change together. Not perfectly aligned,
+    since BCI2000 applies states per sample block."""
     cmd = "; ".join(f"SET STATE {name} {value}" for name, value in states.items())
     try:
         ok = bci.Execute(cmd)
@@ -488,9 +370,9 @@ def safe_set_states(bci, **states):
 # -----------------------------------------------------------------------------
 
 
-# ──────────────────────────────────────────────
-# Fixation Cross + barra de presión + descanso
-# ──────────────────────────────────────────────
+# **********************************************
+# Fixation Cross + pressure bar + rest
+# **********************************************
 
 class FixationCross:
 
@@ -513,21 +395,20 @@ class FixationCross:
         self._bar_fraction = 0.0
         self._rest_text_id = None
         self._rest_num_id = None
-        self._cross_visible = True   # visible por defecto (estado de reposo/evento 0)
+        self._cross_visible = True   # visible by default (rest / event 0)
         self._calibration_banner_id = None
-        self._bar_visible = False        # para saber si redibujar la barra al redimensionar
-        self._current_bar_label = None   # texto actual de la barra (INFLATING/HOLDING/DEFLATING)
+        self._bar_visible = False        # whether to redraw the bar on resize
+        self._current_bar_label = None   # current bar text (INFLATING/HOLDING/DEFLATING)
 
-        # Se conecta en main() a pump.drain. Se llama en CADA tick de espera
-        # (cruz, trials NONE, descansos) para que el puerto serial nunca se
-        # quede sin leer. Sin esto, el buffer se desborda y se pierden fases.
+        # Set to pump.drain in main(). Called on every wait tick so the
+        # serial buffer never overflows and phases aren't lost.
         self.serial_drain = None
 
         self.root = tk.Tk()
         self.root.title("Fixation Cross")
         self.root.configure(bg=bg_color)
-        self.root.geometry(f"{win_width}x{win_height}")   # ventana normal, no fullscreen
-        self.root.resizable(True, True)                   # se puede maximizar/arrastrar a otro monitor
+        self.root.geometry(f"{win_width}x{win_height}")   # normal window, not fullscreen
+        self.root.resizable(True, True)                   # can be maximized/moved to another monitor
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Escape>", self._on_escape)
@@ -541,11 +422,7 @@ class FixationCross:
         self.root.after(100, self._draw_cross)
 
     def _on_configure(self):
-        """Se dispara en CUALQUIER cambio de tamaño de la ventana (maximizar,
-        restaurar, arrastrar a otro monitor). Redibuja todo lo que esté
-        visible en ese momento usando la geometría actual, para que nada
-        quede desalineado (antes solo se redibujaba la cruz, y la barra se
-        quedaba 'chueca' porque el marco no se recalculaba)."""
+        """On any window resize, redraws everything visible with the current geometry."""
         self._draw_cross()
         if self._bar_visible:
             self._redraw_bar_frame()
@@ -592,17 +469,17 @@ class FixationCross:
         )
 
     def show_fixation_cross(self):
-        """Muestra la cruz (usar durante el evento 0 / reposo)."""
+        """Shows the cross (event 0 / rest)."""
         self._cross_visible = True
         self._draw_cross()
 
     def hide_fixation_cross(self):
-        """Oculta la cruz (usar al iniciar el evento 1 / INFLATING)."""
+        """Hides the cross (start of event 1 / INFLATING)."""
         self._cross_visible = False
         self.canvas.delete("cross")
 
     def wait_for_start(self, message: str = "Presione ENTER para iniciar el protocolo"):
-        """Muestra un mensaje y espera a que el investigador presione ENTER para continuar."""
+        """Shows a message and waits for the researcher to press ENTER."""
         w, h = self.get_win_size()
         msg_id = self.canvas.create_text(
             w // 2,
@@ -632,15 +509,14 @@ class FixationCross:
         self.root.update()
 
     def _tick(self):
-        """Un tick de espera: refresca la ventana Y vacía el puerto serial.
-        Todo bucle de espera de esta clase pasa por aquí."""
+        """One wait tick: refreshes the window and drains the serial port."""
         if self.serial_drain is not None:
             self.serial_drain()
         self.root.update()
 
     def pump(self, seconds: float) -> bool:
-        """Mantiene la ventana responsiva durante `seconds` segundos.
-        Retorna False si el usuario cerró o presionó Escape."""
+        """Keeps the window responsive for `seconds`.
+        Returns False if the user closed the window or pressed Escape."""
         end = time.time() + seconds
         while time.time() < end:
             if not self._running:
@@ -650,7 +526,7 @@ class FixationCross:
         return True
 
     def update(self):
-        """Un solo tick del event loop de tkinter."""
+        """Single Tkinter event loop tick."""
         if self._running:
             self.root.update()
 
@@ -661,12 +537,10 @@ class FixationCross:
         except Exception:
             pass
 
-    # ---------- Banner de calibración (persiste durante todo el trial 0) ----------
+    # --- Calibration banner (visible during all of trial 0) ---
 
     def show_calibration_banner(self, text="CALIBRACIÓN"):
-        """Muestra un recuadro fijo arriba de la ventana indicando que se
-        está corriendo la calibración. Se mantiene visible durante todas
-        las etapas (idle/inflating/holding/deflating) del trial 0."""
+        """Shows a fixed banner at the top during all calibration stages."""
         self.canvas.delete("calibration_banner")
         w, h = self.get_win_size()
         pad_x, pad_y = 24, 14
@@ -688,7 +562,7 @@ class FixationCross:
         self.canvas.delete("calibration_banner")
         self._calibration_banner_id = None
 
-    # ---------- Barra de presión (INFLATING / HOLDING / DEFLATING) ----------
+    # --- Pressure bar (INFLATING / HOLDING / DEFLATING) ---
 
     def _bar_geometry(self):
         w, h = self.get_win_size()
@@ -771,12 +645,10 @@ class FixationCross:
         self._bar_visible = False
         self._current_bar_label = None
 
-    # ---------- Descanso: palabra grande + contador + barra que se vacía ----------
+    # --- Rest: large label + countdown + emptying bar ---
 
     def _draw_rest_text(self, label: str, remaining: float):
-        """Dibuja/actualiza 'DESCANSO' en grande y el conteo debajo, justo
-        arriba de la barra — así quedan agrupados visualmente en el centro
-        de la ventana, sin depender del tamaño de la cruz."""
+        """Draws/updates the rest label and countdown just above the bar."""
         x_left, x_right, y_top, _, _, _ = self._bar_geometry()
         cx = (x_left + x_right) // 2
         y_word = y_top - 90
@@ -831,8 +703,8 @@ class FixationCross:
 
 
 def create_block(none, low, high):
-    """Las tres condiciones usan la bomba REAL. NONE ya no es 'sin presión':
-    es la presión más baja de las tres (8 mmHg por defecto)."""
+    """Builds a shuffled block. All three conditions use the real pump;
+    NONE is the lowest pressure (8 mmHg by default)."""
     trials = (
         [(NONE_LABEL, none)] * TRIALS_PER_COND
         + [(LOW_LABEL,  low)]  * TRIALS_PER_COND
@@ -886,15 +758,11 @@ def append_trial_to_results(participant_data, results, block_number, trial_data)
 
 
 def run_real_pressure_phases(pump, cross, bci, events, pressure):
-    """Ejecuta las fases INFLATING -> HOLDING -> DEFLATING usando la bomba
-    REAL, sincronizando la barra visual y los estados de BCI2000 con lo que
-    reporta el Arduino. Los tiempos ya NO son fijos: los marca el hardware.
+    """Runs INFLATING -> HOLDING -> DEFLATING on the real pump, syncing the
+    bar and BCI2000 states with Arduino reports. Timing is set by hardware.
 
-    No hay watchdogs de software: si una fase tarda, se espera. Lo único que
-    interrumpe un trial es un FAULT del Arduino (seguro físico ya disparado,
-    manguito ya venteado).
-
-    Devuelve True si terminó bien, o None si el usuario cerró la ventana.
+    No software watchdogs; only an Arduino FAULT interrupts a trial.
+    Returns True on success, None if the window was closed.
     """
 
     def log(phase, vector):
@@ -903,15 +771,14 @@ def run_real_pressure_phases(pump, cross, bci, events, pressure):
 
     # ---------- INFLATING ----------
     cross.set_bar_label("INFLATING")
-    # StimulusPhase y PressureTarget juntos, en el instante en que ordenamos inflar
+    # StimulusPhase and PressureTarget set together when inflation is commanded
     log("INFLATING", 1)
     safe_set_states(bci, StimulusPhase=1, PressureTarget=pressure)
     set_signal_amplitude(bci, pressure_to_amplitude(pressure))
 
-    pump.send_start(pressure)   # <-- LA BOMBA REALMENTE ARRANCA AQUÍ
+    pump.send_start(pressure)   # <-- PUMP ACTUALLY STARTS HERE
 
-    # Confirmar que el Arduino recibió el comando (imprime "INFLATING").
-    # Si el ack se pierde, se reenvía el START en vez de esperar para siempre.
+    # Confirm the Arduino received START; resend if the ack is lost.
     try:
         ack = wait_for_inflating_ack(pump, cross, pressure)
     except PumpError:
@@ -921,16 +788,13 @@ def run_real_pressure_phases(pump, cross, bci, events, pressure):
         pump.send_stop()
         return None
 
-    # La barra SUBE conforme sube la presión real del MPX. El 100% de la barra
-    # es `pressure` (el target de ESTE trial): 70 mmHg llena la barra si el
-    # target es 70; 30 mmHg la llena si el target es 30.
-    # Sin watchdog: si la bomba tarda, se espera.
+    # Bar rises with real pressure; 100% = this trial's target.
     try:
         got = wait_for_phase(pump, cross, "HOLDING",
                              bar_target=pressure,
                              label_prefix="INFLATING")
     except PumpError:
-        pump.send_stop()   # la bomba no llega a la presión -> cortar
+        pump.send_stop()   # pump can't reach pressure -> stop
         raise
     if got is None:
         pump.send_stop()
@@ -941,9 +805,8 @@ def run_real_pressure_phases(pump, cross, bci, events, pressure):
     log("HOLDING", 2)
     safe_set_state(bci, "StimulusPhase", 2)
 
-    # El Arduino mantiene la presión HOLD_DURATION (10s) por su cuenta y luego
-    # imprime "DEFLATING". La barra sigue mostrando la presión real: si hay una
-    # fuga lenta durante el hold, la vas a VER bajar en la barra.
+    # Arduino holds for HOLD_DURATION (10 s), then sends "DEFLATING".
+    # Bar keeps showing real pressure, so slow leaks are visible.
     try:
         got = wait_for_phase(pump, cross, "DEFLATING",
                              bar_target=pressure, label_prefix="HOLDING")
@@ -960,11 +823,8 @@ def run_real_pressure_phases(pump, cross, bci, events, pressure):
     safe_set_states(bci, StimulusPhase=3, PressureTarget=0)
     set_signal_amplitude(bci, AMPLITUDE_BASE_UV)
 
-    # La barra BAJA sola, porque sigue reflejando la presión real mientras
-    # el manguito se vacía. No hay animación inventada.
-    #
-    # El "DONE" llega cuando el MPX5050DP marca menos de 3 mmHg
-    # (DEFLATE_DONE_MMHG en el .ino). Ese es el ÚNICO criterio de desinflado.
+    # Bar falls with real pressure. "DONE" arrives when the sensor reads
+    # below 3 mmHg (DEFLATE_DONE_MMHG in the .ino).
     try:
         got = wait_for_phase(pump, cross, "DONE",
                              bar_target=pressure, label_prefix="DEFLATING")
@@ -989,12 +849,11 @@ def run_trial(bci, cross, pump, trial_number, condition, pressure, block_number)
         events.append({"phase": phase, "vector": vector, "timestamp": ts})
         safe_set_state(bci, "StimulusPhase", vector)
 
-    # Los 3 estados iniciales del trial en UNA sola llamada (un solo viaje
-    # de red), para que queden alineados entre sí lo más posible.
+    # Initial trial states in one call to keep them aligned.
     safe_set_states(bci, TrialNumber=trial_number, PainLevel=PAIN_MAP[condition], PressureTarget=0)
-    cross.pump(0.15)  # pequeña pausa: evita que las etiquetas se amontonen en el Viewer
+    cross.pump(0.15)  # short pause so labels don't overlap in the Viewer
 
-    # Evento 0 — Cruz de fijación (3s)
+    # Event 0 — Fixation cross (3 s)
     cross.hide_rest_label()
     cross.hide_pressure_bar()
     cross.show_fixation_cross()
@@ -1006,13 +865,11 @@ def run_trial(bci, cross, pump, trial_number, condition, pressure, block_number)
     trial_timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     target_amplitude = pressure_to_amplitude(pressure)
 
-    # Eventos 1-3 — INFLATING / HOLDING / DEFLATING
+    # Events 1-3 — INFLATING / HOLDING / DEFLATING
     cross.hide_fixation_cross()
     cross.show_pressure_bar()
 
-    # Las TRES condiciones (NONE/LOW/HIGH) pasan por la bomba real. Ya no
-    # existe la rama "simulada" de 0 mmHg con barra animada por temporizador:
-    # en NONE el Arduino arranca igual que siempre, solo que el target es 8.
+    # All three conditions use the real pump (NONE target is 8 mmHg).
     if pressure <= 0:
         raise PumpError(
             f"Presión inválida en el trial {trial_number} ({condition}): "
@@ -1024,7 +881,7 @@ def run_trial(bci, cross, pump, trial_number, condition, pressure, block_number)
     if result is None:
         return None
 
-    # Evento 4 — DESCANSO (10s)
+    # Event 4 — Rest (10 s)
     print("    DESCANSO")
     log_event("DESCANSO", 4)
     if not cross.countdown_rest(ITI_TIME, label="DESCANSO"):
@@ -1041,13 +898,9 @@ def run_trial(bci, cross, pump, trial_number, condition, pressure, block_number)
 
 
 def run_calibration(bci, cross, pump, pressure):
-    """
-    Trial 0 — Calibración. Corre UNA sola vez antes de todos los bloques.
-    Usa las mismas duraciones que un trial normal (INFLATING 7s, HOLDING 10s,
-    DEFLATING 3s) y la presión HIGH, con un recuadro rojo fijo 'CALIBRACIÓN'
-    visible durante todas las etapas (idle/inflating/holding/deflating).
-    No tiene fase de descanso larga al final: solo regresa a idle
-    (StimulusPhase=0) para dar paso directo al Trial 1.
+    """Trial 0 — Calibration at HIGH pressure, with a red "CALIBRACIÓN"
+    banner during all stages. No long rest at the end; returns to idle
+    (StimulusPhase=0) before Trial 1.
     """
     print(f"\n{'='*50}")
     print(f"  CALIBRACIÓN (Trial 0) — presión: {pressure} mmHg")
@@ -1064,7 +917,7 @@ def run_calibration(bci, cross, pump, pressure):
 
     cross.show_calibration_banner("CALIBRACIÓN")
 
-    # Etapa idle — cruz de fijación (3s)
+    # Idle stage — fixation cross (3 s)
     cross.hide_rest_label()
     cross.hide_pressure_bar()
     cross.show_fixation_cross()
@@ -1077,7 +930,7 @@ def run_calibration(bci, cross, pump, pressure):
     trial_timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     target_amplitude = pressure_to_amplitude(pressure)
 
-    # Etapas INFLATING / HOLDING / DEFLATING con la BOMBA REAL
+    # INFLATING / HOLDING / DEFLATING with the real pump
     cross.hide_fixation_cross()
     cross.show_pressure_bar()
     print(f"    INFLATING  (bomba REAL -> {pressure} mmHg)")
@@ -1090,7 +943,7 @@ def run_calibration(bci, cross, pump, pressure):
         cross.hide_calibration_banner()
         return None
 
-    # Regresa a idle — sin descanso largo, listo para pasar al Trial 1
+    # Back to idle, no long rest
     cross.hide_pressure_bar()
     safe_set_state(bci, "StimulusPhase", 0)
     log_event("IDLE", 0)
@@ -1134,13 +987,11 @@ def main():
     with open(json_path, "r") as f:
         cfg = json.load(f)
 
-    none = cfg.get("none_pressure", NONE_PRESSURE)   ## control: la bomba SÍ arranca
+    none = cfg.get("none_pressure", NONE_PRESSURE)   ## control: pump still runs
     low  = cfg.get("low_pressure",  46) ## Change the low
     high = cfg.get("high_pressure", 111) ## Change the high
 
-    # Filtro del lado de Python: un JSON mal escrito no debe poder mandarle
-    # una presión absurda al Arduino. El .ino tiene su propio tope, esta es
-    # la primera línea de defensa.
+    # Python-side range check (first line of defense; the .ino has its own limit).
     for label, value in (("none_pressure", none), ("low_pressure", low), ("high_pressure", high)):
         if value <= 0 or value > MAX_SAFE_MMHG:
             print(f"\n⚠  {label} = {value} mmHg está fuera de rango "
@@ -1164,7 +1015,7 @@ def main():
         print("No se pudo conectar/configurar BCI2000. Abortando.")
         return
 
-    # --- Abrir la bomba (Arduino) ANTES de arrancar el protocolo ---
+    # --- Open the pump (Arduino) before starting the protocol ---
     try:
         pump = ArduinoPump(ARDUINO_PORT, ARDUINO_BAUD)
     except PumpError as e:
@@ -1176,23 +1027,14 @@ def main():
             pass
         return
 
-    # OJO con el orden: bci.Start() NO va aquí.
-    #
-    # BCI2000 crea y empieza a escribir el .dat en el instante en que recibe
-    # Start(). Si arrancamos aquí y luego cierras la ventana de la cruz sin
-    # presionar ENTER, ya quedó un .dat de 15-20 segundos en disco — y como
-    # BCI2000 nunca sobrescribe, el siguiente intento se guarda como R02.
-    # Así se acumularon P001S001R01/R02/R03 de 15 s, 23 s y 122 s.
-    #
-    # Ahora Start() va DESPUÉS de que confirmas con ENTER. Si abortas antes,
-    # no se crea ningún archivo y el run sigue disponible.
+    # bci.Start() is called only after ENTER: BCI2000 creates the .dat on
+    # Start() and never overwrites, so aborting earlier would leave a short
+    # file and push the next attempt to R02.
 
     cross = FixationCross()
 
-    # ENLACE CRÍTICO: a partir de aquí, cada tick de espera de la ventana
-    # (cruz, trials NONE, descansos) vacía el puerto serial. Sin esta línea,
-    # el buffer se desborda durante los trials NONE y el siguiente trial con
-    # presión se queda congelado esperando un "INFLATING" que se perdió.
+    # CRITICAL: every wait tick drains the serial port. Without this the
+    # buffer overflows and a later trial can hang waiting for a lost "INFLATING".
     cross.serial_drain = pump.drain
 
     print(f"\n{'='*50}")
@@ -1217,37 +1059,27 @@ def main():
 
     print("  ¡Señal recibida! Iniciando protocolo...\n")
 
-    # AQUÍ sí: a partir de este momento el .dat existe y está creciendo.
+    # From here on the .dat file exists and is recording.
     bci.Start()
     time.sleep(2)
     set_signal_amplitude(bci, AMPLITUDE_BASE_UV)
 
-    # Los 4 estados ya nacen en 0 por defecto (AddStateVariable), así que
-    # la grabación empieza en un baseline de 0 real y limpio. El Viewer de
-    # BCI2000 no dibuja una etiqueta de texto para ese valor inicial (solo
-    # marca CAMBIOS), pero la traza sí está correctamente en 0 desde el
-    # primer instante — no se fuerza ningún valor "dummy" que contamine
-    # el .dat.
+    # All 4 states start at 0 (AddStateVariable default), so the recording
+    # begins at a clean baseline. The Viewer only labels changes, not the initial 0.
 
     bci_disconnected = False
     try:
-        # Cada ejecución es un run completo: R01, R02, R03... El número solo
-        # sirve para nombrar el .dat y el JSON de resultados, no cambia lo que
-        # pasa adentro.
+        # Each execution is a full run (R01, R02...); the number only names files.
         run_num = participant_data["run_number"]
 
-        # Trial 0 — Calibración. Ahora corre SIEMPRE, en todos los runs. Cada
-        # run es una sesión de grabación independiente: el manguito se vuelve
-        # a colocar, el sensor se vuelve a cerar y el participante lleva otro
-        # rato sentado, así que la calibración del run anterior ya no aplica.
+        # Trial 0 — Calibration runs in every run (cuff refitted, sensor re-zeroed).
         calibration_log = run_calibration(bci, cross, pump, high)
         if calibration_log is None:
             print("\n  Experimento interrumpido durante la calibración (ventana cerrada).")
             raise BCI2000DisconnectedError("Ventana de la cruz de fijación cerrada durante la calibración.")
         append_trial_to_results(participant_data, results, block_number=0, trial_data=calibration_log)
 
-        # Pausa después de la calibración: espera ENTER antes de arrancar
-        # los trials. Permite revisar la señal/calibración con calma.
+        # Wait for ENTER after calibration to allow checking the signal.
         print(f"\n{'='*50}")
         print("  Calibración terminada. Presiona ENTER en la ventana de la cruz")
         print("  para iniciar los trials...")
@@ -1264,10 +1096,7 @@ def main():
 
         block_trials = create_block(none, low, high)
 
-        # Los trials se numeran 1..30 en CADA run. Antes se numeraban de
-        # corrido entre bloques (el bloque 2 empezaba en 31), pero ahora cada
-        # .dat es un experimento completo y el TrialNumber tiene que poder
-        # leerse solo, sin saber de qué run vino el archivo.
+        # Trials are numbered 1..30 in every run so each .dat is self-contained.
         global_trial = 1
 
         for trial_idx, (condition, pressure) in enumerate(block_trials, start=1):
@@ -1312,8 +1141,7 @@ def main():
         print("   Los resultados de los trials ya completados se guardaron correctamente.")
 
     finally:
-        # STOP + cierre del puerto SIEMPRE (aunque haya crash): la bomba nunca
-        # debe quedar encendida al terminar.
+        # Always STOP and close the port, even on crash: the pump must never stay on.
         try:
             pump.close()
         except Exception:

@@ -1,37 +1,3 @@
-"""
-PREBASAL — estado basal previo al experimento de dolor.
-
-Graba un .dat de BCI2000 con el participante en reposo, viendo una cruz de
-fijación, durante PREBASAL_SECONDS (5 min por defecto). NO abre el puerto
-serial, NO importa pyserial y NO toca el Arduino: si la bomba está
-desconectada o el .ino no está cargado, este programa corre igual.
-
-Por eso la clase FixationCross de aquí es una versión mínima y propia, y no
-un import de experiment_controller_cruz.py: ese archivo hace `import serial`
-en el encabezado, así que importarlo obligaría a tener la bomba lista para
-grabar un basal donde no hay bomba. Lo único que se comparte son las dos
-piezas que sí tienen que ser idénticas: participant_interface.launch_interface
-y bci_setup_cruz_con_ruta.setup_bci.
-
-CÓMO SE NUMERA ESTE RUN
------------------------
-El basal consume un número de run como cualquier otro (sale de los .dat que
-ya existen en disco). O sea: si es lo primero que corres con el participante,
-el basal queda en R01 y el experimento de dolor arranca en R02. Si prefieres
-tenerlos separados, en la ventana de registro cambia el Session Number a mano
-(p. ej. sesión 99 para basales) y el run se recalcula solo para esa sesión.
-
-MARCADORES EN EL .dat
----------------------
-    StimulusPhase = 0   pre-roll y post-roll (cruz, sin marcar)
-    StimulusPhase = 5   PREBASAL — los 5 min de reposo
-    PainLevel = PressureTarget = TrialNumber = 0   todo el run
-
-El 5 es un código NUEVO, no reutiliza el 0 del experimento de dolor. Así, al
-epocar en MNE, el segmento basal se recorta con un solo criterio
-(StimulusPhase == 5) y nunca se confunde con las cruces de 3 s de los trials.
-"""
-
 import os
 import json
 import time
@@ -42,30 +8,21 @@ from participant_interface import launch_interface
 from bci_setup_cruz_con_ruta import setup_bci
 
 
-# --- Duraciones -------------------------------------------------------------
-PREBASAL_SECONDS = 300      # 5 min de reposo marcados con StimulusPhase = 5
+# --- Durations ---
+PREBASAL_SECONDS = 300  # 5 min baseline marked with StimulusPhase = 5
 
-# Colchones antes y después del basal. El .dat empieza a escribirse unos
-# instantes antes de que el estado cambie, y BCI2000 aplica los estados por
-# bloques de muestras (SampleBlockSize=32 -> 125 ms). Estos segundos de
-# sobra evitan que la primera o la última época del basal caigan cortadas
-# contra el borde del archivo cuando filtres en el análisis.
+# Padding before/after baseline to avoid edge effects during filtering.
 PRE_ROLL_SECONDS  = 5
 POST_ROLL_SECONDS = 5
 
 PREBASAL_PHASE = 5
 
-# Cada cuánto imprimir el tiempo restante EN LA CONSOLA. Nunca en la ventana
-# del participante: igual que en el experimento, la pantalla del participante
-# solo tiene la cruz, sin números ni cuenta regresiva que invite a mirar el
-# reloj en vez de descansar.
+# Console-only countdown interval -> the participant sees only the fixation cross.
 CONSOLE_TICK = 15
 
 
 class FixationCross:
-    """Ventana negra con una cruz blanca centrada. Versión mínima: solo lo
-    que el basal necesita (mostrar la cruz, esperar ENTER, aguantar N
-    segundos sin congelarse, cerrar)."""
+    """Minimal black window with a centered white fixation cross for the baseline."""
 
     def __init__(self, bg_color="black", cross_color="white",
                  arm_pct=0.35, thickness_pct=0.15,
@@ -95,7 +52,7 @@ class FixationCross:
         self.root.update_idletasks()
         self.root.after(100, self._draw_cross)
 
-    # ---------- eventos de ventana ----------
+    # --- Window events ---
 
     def _on_configure(self, event=None):
         self._draw_cross()
@@ -109,7 +66,7 @@ class FixationCross:
     def _on_return(self, event=None):
         self._start_pressed = True
 
-    # ---------- dibujo ----------
+    # --- Drawing ---
 
     def get_win_size(self):
         w = self.canvas.winfo_width()
@@ -138,7 +95,7 @@ class FixationCross:
             fill=self.cross_color, outline=self.cross_color, tags="cross",
         )
 
-    # ---------- espera ----------
+    # --- Waiting ---
 
     def wait_for_start(self, message="Presione ENTER para iniciar el basal"):
         w, h = self.get_win_size()
@@ -163,8 +120,9 @@ class FixationCross:
         self.root.update()
 
     def hold(self, seconds):
-        """Mantiene la ventana viva `seconds` segundos. Devuelve False si el
-        investigador cerró la ventana o presionó Escape."""
+        """Keeps the window open for `seconds` -> returns False if 
+        closed or Escape is pressed.
+        """
         end = time.time() + seconds
         while time.time() < end:
             if not self._running:
@@ -182,14 +140,13 @@ class FixationCross:
 
 
 class BCI2000DisconnectedError(Exception):
-    """Se perdió la conexión con BCI2000 a media grabación."""
+    """BCI2000 connection lost during recording."""
     pass
 
 
 def safe_set_states(bci, **states):
-    """Fija varios estados en UNA sola llamada (mismo criterio que el
-    controlador del experimento: menos viajes = menos riesgo de que dos
-    estados que deben cambiar juntos caigan en bloques distintos)."""
+    """Sets multiple states in one call to keep synchronized 
+    changes in the same block."""
     cmd = "; ".join(f"SET STATE {name} {value}" for name, value in states.items())
     try:
         ok = bci.Execute(cmd)
@@ -201,9 +158,8 @@ def safe_set_states(bci, **states):
 
 
 def hold_with_console_countdown(cross, seconds, label):
-    """Aguanta `seconds` mostrando el restante en CONSOLA cada CONSOLE_TICK.
-    Devuelve los segundos que realmente transcurrieron (menos que `seconds`
-    si se abortó)."""
+    """Waits `seconds`, printing the remaining time every CONSOLE_TICK. 
+    Returns elapsed seconds."""
     started = time.time()
     remaining = seconds
 
@@ -301,19 +257,19 @@ def main():
     completed = False
     disconnected = False
 
-    # A partir de aquí el .dat existe y está creciendo.
+    # From here, the .dat file exists and is growing.
     bci.Start()
     time.sleep(2)
 
     try:
-        # --- Pre-roll: cruz, estados en 0 ---------------------------------
+        # --- Pre-roll: cross, states set to 0 ---
         safe_set_states(bci, StimulusPhase=0, PainLevel=0,
                         PressureTarget=0, TrialNumber=0)
         print(f"  Pre-roll ({PRE_ROLL_SECONDS} s)...")
         if not cross.hold(PRE_ROLL_SECONDS):
             raise BCI2000DisconnectedError("Ventana cerrada durante el pre-roll.")
 
-        # --- Basal --------------------------------------------------------
+        # --- Basal ---
         safe_set_states(bci, StimulusPhase=PREBASAL_PHASE)
         print(f"  PREBASAL — StimulusPhase = {PREBASAL_PHASE} — "
               f"{PREBASAL_SECONDS} s")
@@ -330,7 +286,7 @@ def main():
 
         completed = True
 
-        # --- Post-roll ----------------------------------------------------
+        # --- Post-roll ---
         safe_set_states(bci, StimulusPhase=0)
         print(f"  Post-roll ({POST_ROLL_SECONDS} s)...")
         cross.hold(POST_ROLL_SECONDS)
