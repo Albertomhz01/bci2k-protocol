@@ -1,1 +1,8 @@
+# DS_Store for mac
 .DS_Store
+
+# Python virtual environment
+.venv/
+
+# BCI2000 folder
+BCI2000/

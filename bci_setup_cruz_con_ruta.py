@@ -5,7 +5,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 DATA_DIRECTORY = os.path.join(HERE, "dat_bci")
-PARAMETER_FILE = os.path.join(HERE, "Parametros", "Parametros.prm")
+PARAMETER_FILE = os.path.join(HERE, "Parameters", "Parametros.prm")
 
 BCI2000_ROOT_DEFAULT = r"C:\Users\L03579841\Desktop\bcipy\BCI2000\BCI2000 v3.6.beta.R7385\BCI2000.x64" # <- change to your BCI2000 location
 BCI2000_ROOT  = os.environ.get("BCI2000_ROOT", BCI2000_ROOT_DEFAULT)
